@@ -215,3 +215,19 @@ def test_messages_gates_on_ownership(fake_helpers):
     with pytest.raises(HTTPException) as exc:
         _route("/api/companion/email/messages", "GET")(_request(owner="alice"), account_id="foreign")
     assert exc.value.status_code == 404
+
+
+def test_messages_null_owner_is_403(fake_helpers):
+    # A null/empty owner makes _assert_owns_account a no-op — it must be refused
+    # BEFORE any account access, not allowed to reach an arbitrary mailbox.
+    calls, _ = fake_helpers
+    with pytest.raises(HTTPException) as exc:
+        _route("/api/companion/email/messages", "GET")(_request(owner=None), account_id="a")
+    assert exc.value.status_code == 403
+    assert calls["asserted"] == []  # never even called the (no-op) ownership check
+
+
+def test_read_message_null_owner_is_403(fake_helpers):
+    with pytest.raises(HTTPException) as exc:
+        _route("/api/companion/email/message/{uid}", "GET")(_request(owner=None), uid="1", account_id="a")
+    assert exc.value.status_code == 403

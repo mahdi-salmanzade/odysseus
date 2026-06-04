@@ -830,6 +830,11 @@ def setup_companion_routes() -> APIRouter:
         from routes.email_helpers import _assert_owns_account, _imap, _decode_header
 
         owner = token_owner(request)
+        # A null/empty owner makes _assert_owns_account a no-op AND unscopes the
+        # config lookup — i.e. it would reach ANY mailbox. Fail closed, exactly
+        # like the email write path.
+        if not owner:
+            raise HTTPException(403, "Could not resolve an owner for this token.")
         _assert_owns_account(account_id, owner)  # 404 on cross-owner — the gate
         limit = max(1, min(int(limit or 30), 100))
         out = []
@@ -864,6 +869,8 @@ def setup_companion_routes() -> APIRouter:
         from routes.email_helpers import _assert_owns_account, _imap, _decode_header, _extract_text
 
         owner = token_owner(request)
+        if not owner:
+            raise HTTPException(403, "Could not resolve an owner for this token.")
         _assert_owns_account(account_id, owner)
         try:
             with _imap(account_id, owner=owner) as conn:

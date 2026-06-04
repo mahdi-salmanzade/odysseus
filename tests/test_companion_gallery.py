@@ -174,3 +174,17 @@ def test_image_owned_but_file_absent_is_404(db_with, monkeypatch):
     with pytest.raises(HTTPException) as exc:
         _route("/api/companion/gallery/image/{image_id}", "GET")(_request(owner="alice"), image_id=1)
     assert exc.value.status_code == 404
+
+
+def test_image_filename_cannot_escape_image_dir(db_with, monkeypatch):
+    # A malicious stored filename must be collapsed to a basename under the
+    # image dir — never resolve to an arbitrary path via '../' traversal.
+    db_with([_img(1, "alice", filename="../../../../etc/passwd")])
+    seen = {}
+    monkeypatch.setattr(os.path, "isfile", lambda p: seen.setdefault("path", p) and False)
+    with pytest.raises(HTTPException) as exc:
+        _route("/api/companion/gallery/image/{image_id}", "GET")(_request(owner="alice"), image_id=1)
+    assert exc.value.status_code == 404
+    checked = seen["path"]
+    assert ".." not in checked
+    assert checked == os.path.join("data", "generated_images", "passwd")
