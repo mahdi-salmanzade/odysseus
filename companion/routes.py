@@ -783,6 +783,149 @@ def setup_companion_routes() -> APIRouter:
         finally:
             db.close()
 
+    # ---- Email ------------------------------------------------------------
+    # Owner-scoped email for the phone. Account selection is the security crux:
+    # every endpoint resolves the token's real owner and calls
+    # email_helpers._assert_owns_account(account_id, owner) BEFORE touching creds
+    # or opening IMAP/SMTP — so a caller can only ever act on their OWN mailbox
+    # (cross-owner account_id → 404). Reuses the vetted module-level helpers
+    # rather than reimplementing transport. Companion scope required. Never
+    # returns imap/smtp passwords.
+
+    @router.get("/email/accounts")
+    def email_accounts(request: Request):
+        """The caller's own email accounts (no secrets). Companion scope."""
+        if not has_companion_scope(request):
+            raise HTTPException(403, "This token is not allowed to read email.")
+        from core.database import SessionLocal, EmailAccount
+
+        owner = token_owner(request)
+        out = []
+        db = SessionLocal()
+        try:
+            q = db.query(EmailAccount)
+            if owner:
+                q = q.filter((EmailAccount.owner == owner) | (EmailAccount.owner == None))  # noqa: E711
+            for a in q.all():
+                if not owner_can_see(a.owner, owner):
+                    continue
+                out.append({
+                    "id": a.id,
+                    "name": a.name,
+                    "from_address": a.from_address,
+                    "enabled": bool(a.enabled),
+                    "is_default": bool(a.is_default),
+                })
+        finally:
+            db.close()
+        return {"items": out}
+
+    @router.get("/email/messages")
+    def email_messages(request: Request, account_id: str, folder: str = "INBOX", limit: int = 30):
+        """List recent message headers from one of the caller's mailboxes.
+        Owner-asserted before any IMAP I/O. Companion scope."""
+        if not has_companion_scope(request):
+            raise HTTPException(403, "This token is not allowed to read email.")
+        import email as _email
+        from routes.email_helpers import _assert_owns_account, _imap, _decode_header
+
+        owner = token_owner(request)
+        _assert_owns_account(account_id, owner)  # 404 on cross-owner — the gate
+        limit = max(1, min(int(limit or 30), 100))
+        out = []
+        try:
+            with _imap(account_id, owner=owner) as conn:
+                conn.select(folder, readonly=True)
+                typ, data = conn.uid("search", None, "ALL")
+                uids = (data[0].split() if data and data[0] else [])[-limit:]
+                for u in reversed(uids):
+                    typ, md = conn.uid("fetch", u, "(BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE)])")
+                    if not md or not md[0]:
+                        continue
+                    msg = _email.message_from_bytes(md[0][1])
+                    out.append({
+                        "uid": u.decode() if isinstance(u, bytes) else str(u),
+                        "subject": _decode_header(msg.get("Subject")),
+                        "from": _decode_header(msg.get("From")),
+                        "date": msg.get("Date"),
+                    })
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(502, f"Could not reach the mailbox: {e}")
+        return {"items": out, "folder": folder}
+
+    @router.get("/email/message/{uid}")
+    def email_message(request: Request, uid: str, account_id: str, folder: str = "INBOX"):
+        """Read one message's text body. Owner-asserted. Companion scope."""
+        if not has_companion_scope(request):
+            raise HTTPException(403, "This token is not allowed to read email.")
+        import email as _email
+        from routes.email_helpers import _assert_owns_account, _imap, _decode_header, _extract_text
+
+        owner = token_owner(request)
+        _assert_owns_account(account_id, owner)
+        try:
+            with _imap(account_id, owner=owner) as conn:
+                conn.select(folder, readonly=True)
+                typ, md = conn.uid("fetch", uid.encode() if isinstance(uid, str) else uid, "(RFC822)")
+                if not md or not md[0]:
+                    raise HTTPException(404, "Message not found")
+                msg = _email.message_from_bytes(md[0][1])
+                return {
+                    "uid": uid,
+                    "subject": _decode_header(msg.get("Subject")),
+                    "from": _decode_header(msg.get("From")),
+                    "to": _decode_header(msg.get("To")),
+                    "date": msg.get("Date"),
+                    "body": _extract_text(msg),
+                }
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(502, f"Could not read the message: {e}")
+
+    @router.post("/email/send")
+    def email_send(
+        request: Request,
+        account_id: str = Form(...),
+        to: str = Form(...),
+        subject: str = Form(""),
+        body: str = Form(""),
+    ):
+        """Send a plain-text email from one of the caller's OWN accounts.
+        Owner-asserted before creds are read. Companion scope."""
+        if not has_companion_scope(request):
+            raise HTTPException(403, "This token is not allowed to send email.")
+        from email.mime.text import MIMEText
+        from email.utils import parseaddr
+        from routes.email_helpers import _assert_owns_account, _get_email_config, _send_smtp_message
+
+        owner = token_owner(request)
+        if not owner:
+            raise HTTPException(403, "Could not resolve an owner for this token.")
+        _assert_owns_account(account_id, owner)
+
+        recipients = [r.strip() for r in to.replace(";", ",").split(",") if r.strip()]
+        if not recipients or not all("@" in parseaddr(r)[1] for r in recipients):
+            raise HTTPException(400, "Provide at least one valid recipient address.")
+
+        cfg = _get_email_config(account_id, owner=owner)
+        from_addr = cfg.get("from_address") or cfg.get("smtp_user") or ""
+        if not cfg.get("smtp_host") or not from_addr:
+            raise HTTPException(400, "This account has no SMTP configuration.")
+        msg = MIMEText(body or "", _charset="utf-8")
+        msg["Subject"] = subject or ""
+        msg["From"] = from_addr
+        msg["To"] = ", ".join(recipients)
+        try:
+            _send_smtp_message(cfg, from_addr, recipients, msg.as_string())
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(502, f"Send failed: {e}")
+        return {"status": "sent", "to": recipients}
+
     # ---- Writes -----------------------------------------------------------
     # The reads above are the established pattern; these add the phone's
     # create/delete/toggle affordances. Each write requires the companion scope
