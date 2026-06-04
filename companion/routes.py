@@ -993,6 +993,101 @@ def setup_companion_routes() -> APIRouter:
             raise HTTPException(404, "Image not found")
         return FileResponse(path)
 
+    # ---- Personal assistant -----------------------------------------------
+    # View/edit the caller's per-owner assistant (CrewMember, is_default_
+    # assistant). Owner-scoped to the token's REAL owner — which is never the
+    # synthetic "api" pseudo-user, so unlike the bearer path through the stock
+    # route this resolves a genuine owner. We do NOT seed ScheduledTask
+    # check-ins from the phone (a desktop concern); just the assistant row.
+    # Companion scope required.
+
+    _ASSISTANT_SYNTHETIC = frozenset({"internal-tool", "api", "demo", "system", ""})
+
+    def _assistant_dict(c):
+        return {
+            "id": c.id,
+            "name": c.name,
+            "user_name": c.user_name,
+            "personality": c.personality,
+            "model": c.model,
+            "greeting": c.greeting,
+            "timezone": c.timezone,
+            "avatar": c.avatar,
+            "enabled": bool(c.is_active),
+        }
+
+    @router.get("/assistant")
+    def assistant_get(request: Request):
+        """The caller's personal assistant, or {assistant: null} if none yet.
+        Companion scope."""
+        if not has_companion_scope(request):
+            raise HTTPException(403, "This token is not allowed to read the assistant.")
+        from core.database import SessionLocal, CrewMember
+
+        owner = token_owner(request)
+        db = SessionLocal()
+        try:
+            q = db.query(CrewMember).filter(CrewMember.is_default_assistant == True)  # noqa: E712
+            if owner:
+                q = q.filter(CrewMember.owner == owner)
+            crew = q.first()
+            # Defense in depth: never hand back another owner's row.
+            if crew and crew.owner != owner:
+                crew = None
+            return {"assistant": _assistant_dict(crew) if crew else None}
+        finally:
+            db.close()
+
+    @router.patch("/assistant")
+    def assistant_patch(
+        request: Request,
+        name: str = Form(None),
+        user_name: str = Form(None),
+        personality: str = Form(None),
+        greeting: str = Form(None),
+        model: str = Form(None),
+        timezone: str = Form(None),
+    ):
+        """Update (creating if absent) the caller's personal assistant. Companion
+        scope. Refuses synthetic/non-human owners."""
+        if not has_companion_scope(request):
+            raise HTTPException(403, "This token is not allowed to edit the assistant.")
+        import uuid as _uuid
+        from core.database import SessionLocal, CrewMember
+
+        owner = token_owner(request)
+        if not owner or owner in _ASSISTANT_SYNTHETIC:
+            raise HTTPException(400, "Cannot edit an assistant for this token owner.")
+        db = SessionLocal()
+        try:
+            crew = db.query(CrewMember).filter(
+                CrewMember.owner == owner,
+                CrewMember.is_default_assistant == True,  # noqa: E712
+            ).first()
+            if crew is None:
+                crew = CrewMember(
+                    id=str(_uuid.uuid4()),
+                    owner=owner,
+                    name=name or "Assistant",
+                    is_default_assistant=True,
+                    is_active=True,
+                )
+                db.add(crew)
+            # Strict: never mutate a row we don't own (paranoia; query already scopes).
+            elif crew.owner != owner:
+                raise HTTPException(404, "Assistant not found")
+            for field, value in (
+                ("name", name), ("user_name", user_name), ("personality", personality),
+                ("greeting", greeting), ("model", model), ("timezone", timezone),
+            ):
+                if value is not None:
+                    setattr(crew, field, value)
+            db.commit()
+            db.refresh(crew)
+            return {"assistant": _assistant_dict(crew)}
+        finally:
+            db.close()
+
     # ---- Writes -----------------------------------------------------------
     # The reads above are the established pattern; these add the phone's
     # create/delete/toggle affordances. Each write requires the companion scope
