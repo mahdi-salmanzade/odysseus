@@ -514,6 +514,107 @@ def setup_companion_routes() -> APIRouter:
         finally:
             db.close()
 
+    # ---- Model compare (history + verdict record) -------------------------
+    # The phone runs the two model streams itself via the EXISTING owner-scoped
+    # /api/session + /api/chat_stream — so it never touches the stock
+    # /api/compare/start, whose endpoint-key lookup is not owner-scoped. These
+    # endpoints only persist and list the caller's own comparison verdicts.
+
+    @router.get("/compare/history")
+    def compare_history(request: Request):
+        """The caller's own past model comparisons, newest first. Companion scope."""
+        if not has_companion_scope(request):
+            raise HTTPException(403, "This token is not allowed to read comparisons.")
+        from core.database import SessionLocal, Comparison
+
+        owner = token_owner(request)
+        out = []
+        db = SessionLocal()
+        try:
+            q = db.query(Comparison)
+            if owner:
+                q = q.filter((Comparison.owner == owner) | (Comparison.owner == None))  # noqa: E711
+            for c in q.all():
+                if not owner_can_see(c.owner, owner):
+                    continue
+                out.append({
+                    "id": c.id,
+                    "prompt": (c.prompt or "")[:100],
+                    "model_a": c.model_a,
+                    "model_b": c.model_b,
+                    "winner": c.winner,
+                    "is_blind": bool(c.is_blind),
+                    "voted_at": c.voted_at.isoformat() if c.voted_at else None,
+                    "created_at": c.created_at.isoformat() if getattr(c, "created_at", None) else None,
+                })
+        finally:
+            db.close()
+        out.sort(key=lambda r: r.get("created_at") or "", reverse=True)
+        return {"items": out}
+
+    @router.post("/compare/record")
+    def compare_record(
+        request: Request,
+        prompt: str = Form(...),
+        model_a: str = Form(...),
+        model_b: str = Form(...),
+        winner: str = Form(...),        # "a", "b", or "tie"
+        is_blind: str = Form("false"),
+    ):
+        """Persist a comparison verdict owned by the caller. Companion scope."""
+        if not has_companion_scope(request):
+            raise HTTPException(403, "This token is not allowed to record comparisons.")
+        if winner not in ("a", "b", "tie"):
+            raise HTTPException(400, "winner must be 'a', 'b', or 'tie'")
+        import uuid as _uuid
+        from datetime import datetime as _dt
+        from core.database import SessionLocal, Comparison
+
+        owner = token_owner(request)
+        if not owner:
+            raise HTTPException(403, "Could not resolve an owner for this token.")
+        comp_id = str(_uuid.uuid4())
+        db = SessionLocal()
+        try:
+            comp = Comparison(
+                id=comp_id,
+                prompt=(prompt or "")[:500],
+                model_a=model_a,
+                model_b=model_b,
+                endpoint_a="",
+                endpoint_b="",
+                winner=winner,
+                is_blind=str(is_blind).lower() == "true",
+                voted_at=_dt.utcnow(),
+                owner=owner,
+            )
+            db.add(comp)
+            db.commit()
+        finally:
+            db.close()
+        return {"id": comp_id, "status": "ok"}
+
+    @router.delete("/compare/{comp_id}")
+    def compare_delete(request: Request, comp_id: str):
+        """Delete one of the caller's comparisons. Strict ownership: missing OR
+        cross-owner (incl. legacy null-owner shared) → 404, never confirming
+        existence to a non-owner. Companion scope."""
+        if not has_companion_scope(request):
+            raise HTTPException(403, "This token is not allowed to delete comparisons.")
+        from core.database import SessionLocal, Comparison
+
+        owner = token_owner(request)
+        db = SessionLocal()
+        try:
+            comp = db.query(Comparison).filter(Comparison.id == comp_id).first()
+            if not comp or comp.owner != owner:
+                raise HTTPException(404, "Comparison not found")
+            db.delete(comp)
+            db.commit()
+            return {"status": "deleted"}
+        finally:
+            db.close()
+
     # ---- Writes -----------------------------------------------------------
     # The reads above are the established pattern; these add the phone's
     # create/delete/toggle affordances. Each write requires the companion scope
