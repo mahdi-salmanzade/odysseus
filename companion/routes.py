@@ -1088,6 +1088,54 @@ def setup_companion_routes() -> APIRouter:
         finally:
             db.close()
 
+    # ---- Skills -----------------------------------------------------------
+    # Read-only view of the caller's learned skills. SkillsManager.load(owner)
+    # already scopes to that owner's skills, so passing the token's REAL owner
+    # (not the sandboxed "api") is the whole fix — a cross-owner skill name
+    # simply isn't in the list, so markdown lookup 404s. Companion scope
+    # required. (Writing/auditing skills stays admin-only on the stock routes.)
+
+    @router.get("/skills")
+    def skills(request: Request):
+        """List the caller's own learned skills (name/description/category)."""
+        if not has_companion_scope(request):
+            raise HTTPException(403, "This token is not allowed to read skills.")
+        from core.constants import DATA_DIR
+        from services.memory.skills import SkillsManager
+
+        owner = token_owner(request)
+        sm = SkillsManager(DATA_DIR)
+        out = []
+        for s in sm.load(owner=owner):
+            out.append({
+                "name": s.get("name"),
+                "description": s.get("description"),
+                "category": s.get("category"),
+            })
+        return {"items": out}
+
+    @router.get("/skills/{name}/markdown")
+    def skill_markdown(request: Request, name: str):
+        """Raw SKILL.md for one of the caller's skills. 404 for a skill the
+        caller doesn't own (it isn't in their scoped list). Companion scope."""
+        if not has_companion_scope(request):
+            raise HTTPException(403, "This token is not allowed to read skills.")
+        from core.constants import DATA_DIR
+        from services.memory.skills import SkillsManager
+
+        owner = token_owner(request)
+        sm = SkillsManager(DATA_DIR)
+        match = next(
+            (s for s in sm.load(owner=owner) if s.get("name") == name or s.get("id") == name),
+            None,
+        )
+        if not match:
+            raise HTTPException(404, "Skill not found")
+        md = sm.read_skill_md(match.get("name"), owner=owner)
+        if md is None:
+            raise HTTPException(404, "Skill source unavailable")
+        return {"name": match.get("name"), "markdown": md}
+
     # ---- Writes -----------------------------------------------------------
     # The reads above are the established pattern; these add the phone's
     # create/delete/toggle affordances. Each write requires the companion scope
