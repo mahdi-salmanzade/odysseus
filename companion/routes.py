@@ -1136,6 +1136,150 @@ def setup_companion_routes() -> APIRouter:
             raise HTTPException(404, "Skill source unavailable")
         return {"name": match.get("name"), "markdown": md}
 
+    # ---- Admin-only features (behind require_companion_admin) -------------
+    # Each endpoint below re-establishes ADMIN privilege from the token's real
+    # owner via require_companion_admin (off-by-default setting + companion
+    # scope + owner-is-admin). The stock routes hard-block the bearer "api" user
+    # by design; we NEVER call their _require_admin (it always 403s a bearer).
+    # contacts/mcp/cookbook/vault are read-only here; terminal is full exec.
+
+    @router.get("/contacts")
+    def contacts_list(request: Request, q: str = ""):
+        """List/search the address book (admin-gated). Contacts are a single
+        shared store, so the gate is the only access control."""
+        require_companion_admin(request)
+        from routes.contacts_routes import _fetch_contacts
+
+        contacts = _fetch_contacts() or []
+        if q:
+            ql = q.lower()
+            contacts = [
+                c for c in contacts
+                if ql in (c.get("name") or "").lower()
+                or any(ql in (e or "").lower() for e in (c.get("emails") or []))
+            ][:50]
+        return {"items": contacts, "count": len(contacts)}
+
+    @router.post("/terminal/exec")
+    def terminal_exec(request: Request, command: str = Form(...), timeout: int = Form(60)):
+        """Run a shell command on the server and return its output (admin-gated).
+        This is full RCE by design — reachable ONLY when an admin has enabled
+        companion admin access AND the paired token's owner is an admin AND the
+        token carries the companion scope (require_companion_admin enforces all
+        three). The stock /api/shell/exec refuses the bearer 'api' user; this is
+        the sanctioned, explicitly-opted-in path."""
+        require_companion_admin(request)
+        import subprocess
+
+        cmd = (command or "").strip()
+        if not cmd:
+            raise HTTPException(400, "command is required")
+        timeout = max(1, min(int(timeout or 60), 300))
+        try:
+            proc = subprocess.run(
+                cmd, shell=True, capture_output=True, text=True, timeout=timeout,
+            )
+            return {
+                "stdout": proc.stdout,
+                "stderr": proc.stderr,
+                "exit_code": proc.returncode,
+            }
+        except subprocess.TimeoutExpired:
+            raise HTTPException(504, f"Command timed out after {timeout}s")
+
+    @router.get("/vault/status")
+    def vault_status(request: Request):
+        """Whether the Bitwarden/Vaultwarden vault is unlocked (admin-gated).
+        Read-only: never returns the session key or any secret."""
+        require_companion_admin(request)
+        from routes.vault_routes import _load_config
+
+        cfg = _load_config() or {}
+        return {
+            "unlocked": bool(cfg.get("session")),
+            "unlocked_at": cfg.get("unlocked_at", ""),
+            "configured": bool(cfg.get("email") or cfg.get("url")),
+        }
+
+    @router.post("/vault/unlock")
+    async def vault_unlock(request: Request, master_password: str = Form(...)):
+        """Unlock the vault and persist the session (admin-gated). Does NOT
+        export any secret to the phone — only flips the unlocked state. The
+        master password rides the environment (not argv), mirroring the stock
+        route."""
+        require_companion_admin(request)
+        from datetime import datetime as _dt
+        from routes.vault_routes import _load_config, _save_config, _run_bw
+
+        stdout, stderr, rc = await _run_bw(
+            ["unlock", "--passwordenv", "BW_PASSWORD", "--raw"],
+            bw_password=master_password,
+        )
+        if rc != 0:
+            return {"ok": False, "error": f"Unlock failed: {(stderr or '')[:300]}"}
+        cfg = _load_config() or {}
+        cfg["session"] = (stdout or "").strip()
+        cfg["unlocked_at"] = _dt.utcnow().isoformat()
+        _save_config(cfg)
+        return {"ok": True, "unlocked": True, "unlocked_at": cfg["unlocked_at"]}
+
+    @router.get("/mcp/servers")
+    def mcp_servers(request: Request):
+        """List configured MCP servers (admin-gated, read-only). Strips env vars
+        and OAuth config so no server secrets reach the phone."""
+        require_companion_admin(request)
+        from core.database import SessionLocal, McpServer
+
+        out = []
+        db = SessionLocal()
+        try:
+            for s in db.query(McpServer).all():
+                out.append({
+                    "id": s.id,
+                    "name": s.name,
+                    "transport": s.transport,
+                    "command": s.command,
+                    "url": s.url,
+                    "enabled": bool(s.is_enabled),
+                })
+        finally:
+            db.close()
+        return {"items": out}
+
+    @router.get("/cookbook/state")
+    def cookbook_state(request: Request):
+        """Read the cookbook state (admin-gated, read-only), with secrets
+        stripped — drops the env block and any secret/token/password/key fields
+        from tasks so nothing sensitive reaches the phone."""
+        require_companion_admin(request)
+        import json as _json
+        import os
+        from core.constants import DATA_DIR
+
+        path = os.path.join(DATA_DIR, "cookbook_state.json")
+        if not os.path.isfile(path):
+            return {"state": {}}
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                state = _json.load(f)
+        except (ValueError, OSError):
+            return {"state": {}}
+
+        def _sanitize(obj):
+            if isinstance(obj, dict):
+                clean = {}
+                for k, v in obj.items():
+                    kl = str(k).lower()
+                    if kl == "env" or any(s in kl for s in ("secret", "token", "password", "api_key", "apikey")):
+                        continue
+                    clean[k] = _sanitize(v)
+                return clean
+            if isinstance(obj, list):
+                return [_sanitize(x) for x in obj]
+            return obj
+
+        return {"state": _sanitize(state)}
+
     # ---- Writes -----------------------------------------------------------
     # The reads above are the established pattern; these add the phone's
     # create/delete/toggle affordances. Each write requires the companion scope
