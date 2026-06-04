@@ -926,6 +926,73 @@ def setup_companion_routes() -> APIRouter:
             raise HTTPException(502, f"Send failed: {e}")
         return {"status": "sent", "to": recipients}
 
+    # ---- Gallery ----------------------------------------------------------
+    # Owner-scoped image library. The list returns metadata + a companion image
+    # URL; the bytes are served by a SEPARATE owner-checked endpoint (resolve
+    # the row by id, verify the caller may see it, then stream the file) so the
+    # phone never needs the unscoped stock /api/generated-image/{filename} path.
+    # Companion scope required.
+
+    @router.get("/gallery")
+    def gallery(request: Request):
+        """List the caller's own gallery images (metadata + companion image URL)."""
+        if not has_companion_scope(request):
+            raise HTTPException(403, "This token is not allowed to read the gallery.")
+        from core.database import SessionLocal, GalleryImage
+
+        owner = token_owner(request)
+        out = []
+        db = SessionLocal()
+        try:
+            q = db.query(GalleryImage).filter(GalleryImage.is_active == True)  # noqa: E712
+            if owner:
+                q = q.filter((GalleryImage.owner == owner) | (GalleryImage.owner == None))  # noqa: E711
+            for im in q.all():
+                if not owner_can_see(im.owner, owner):
+                    continue
+                created = getattr(im, "taken_at", None) or getattr(im, "created_at", None)
+                out.append({
+                    "id": im.id,
+                    "prompt": im.prompt,
+                    "model": im.model,
+                    "favorite": bool(im.favorite),
+                    "width": im.width,
+                    "height": im.height,
+                    "created_at": created and str(created),
+                    "image_url": f"/api/companion/gallery/image/{im.id}",
+                })
+        finally:
+            db.close()
+        out.sort(key=lambda r: r.get("created_at") or "", reverse=True)
+        return {"items": out}
+
+    @router.get("/gallery/image/{image_id}")
+    def gallery_image(request: Request, image_id: str):
+        """Stream one of the caller's images. 404 (not 403) for a missing OR
+        cross-owner image, before any file access. Companion scope."""
+        if not has_companion_scope(request):
+            raise HTTPException(403, "This token is not allowed to read the gallery.")
+        import os
+        import re as _re
+        from fastapi.responses import FileResponse
+        from core.database import SessionLocal, GalleryImage
+
+        owner = token_owner(request)
+        db = SessionLocal()
+        try:
+            im = db.query(GalleryImage).filter(GalleryImage.id == image_id).first()
+            if not im or not owner_can_see(im.owner, owner):
+                raise HTTPException(404, "Image not found")
+            filename = im.filename or ""
+        finally:
+            db.close()
+        # Defensive basename — never let a stored filename escape the image dir.
+        safe = _re.sub(r"[^A-Za-z0-9._-]", "_", os.path.basename(filename))[:160]
+        path = os.path.join("data", "generated_images", safe)
+        if not safe or not os.path.isfile(path):
+            raise HTTPException(404, "Image not found")
+        return FileResponse(path)
+
     # ---- Writes -----------------------------------------------------------
     # The reads above are the established pattern; these add the phone's
     # create/delete/toggle affordances. Each write requires the companion scope
