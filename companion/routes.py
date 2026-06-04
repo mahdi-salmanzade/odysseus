@@ -449,6 +449,71 @@ def setup_companion_routes() -> APIRouter:
             db.close()
         return {"items": out}
 
+    @router.get("/documents")
+    def documents(request: Request):
+        """List the caller's own documents (RAG library), newest first.
+
+        Owner-scoped exactly like the stock /api/documents/library, but resolved
+        to the token's real owner (plus legacy null-owner shared rows) instead of
+        the sandboxed "api" user. Read-only summary — returns a short content
+        snippet, never the full body (that's the per-doc GET below). Requires the
+        companion scope."""
+        if not has_companion_scope(request):
+            raise HTTPException(403, "This token is not allowed to read documents.")
+        from core.database import SessionLocal, Document
+
+        owner = token_owner(request)
+        out = []
+        db = SessionLocal()
+        try:
+            q = db.query(Document).filter(Document.is_active == True)  # noqa: E712
+            # Exclude archived (NULL = legacy rows = not archived).
+            q = q.filter((Document.archived == False) | (Document.archived == None))  # noqa: E711,E712
+            if owner:
+                q = q.filter((Document.owner == owner) | (Document.owner == None))  # noqa: E711
+            for d in q.all():
+                if not owner_can_see(d.owner, owner):
+                    continue
+                content = d.current_content or ""
+                out.append({
+                    "id": d.id,
+                    "title": d.title,
+                    "language": d.language,
+                    "snippet": content[:200],
+                    "updated_at": getattr(d, "updated_at", None) and str(d.updated_at),
+                })
+        finally:
+            db.close()
+        # Newest first when a timestamp is available; stable otherwise.
+        out.sort(key=lambda r: r.get("updated_at") or "", reverse=True)
+        return {"items": out}
+
+    @router.get("/documents/{doc_id}")
+    def document_detail(request: Request, doc_id: str):
+        """Full body of one of the caller's documents. 404 (never 403) for a
+        missing OR cross-owner doc, so existence is never confirmed to a
+        non-owner. Requires the companion scope."""
+        if not has_companion_scope(request):
+            raise HTTPException(403, "This token is not allowed to read documents.")
+        from core.database import SessionLocal, Document
+
+        owner = token_owner(request)
+        db = SessionLocal()
+        try:
+            doc = db.query(Document).filter(Document.id == doc_id).first()
+            if not doc or not owner_can_see(doc.owner, owner):
+                raise HTTPException(404, "Document not found")
+            return {
+                "id": doc.id,
+                "title": doc.title,
+                "language": doc.language,
+                "content": doc.current_content or "",
+                "archived": bool(doc.archived),
+                "updated_at": getattr(doc, "updated_at", None) and str(doc.updated_at),
+            }
+        finally:
+            db.close()
+
     # ---- Writes -----------------------------------------------------------
     # The reads above are the established pattern; these add the phone's
     # create/delete/toggle affordances. Each write requires the companion scope
