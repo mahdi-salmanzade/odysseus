@@ -29,6 +29,13 @@ def _invalidate_caches():
 # ── Default values ──
 
 DEFAULT_SETTINGS = {
+    # Companion bridge: gate for ADMIN-only mobile features (terminal, vault,
+    # MCP, cookbook, contacts). Off by default — an admin must explicitly opt
+    # in (here or via the admin POST /settings route) before a paired phone can
+    # reach any admin-privileged companion endpoint, AND the paired token's
+    # owner must itself be an admin. Fail-closed; see companion/routes.py
+    # require_companion_admin().
+    "companion_admin_enabled": False,
     "image_gen_enabled": True,
     "image_model": "",
     "image_quality": "medium",

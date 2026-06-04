@@ -68,6 +68,61 @@ def has_companion_scope(request: Request) -> bool:
     return "companion" in scopes
 
 
+def companion_admin_available(request: Request) -> bool:
+    """Whether ADMIN-only companion features are reachable for this caller.
+
+    A pure-ish predicate (no raise) the status endpoint uses to tell a paired
+    phone whether to even show admin tabs (terminal/vault/mcp/cookbook/contacts).
+    True only when ALL hold — the same triple lock require_companion_admin
+    enforces:
+      1. an admin flipped on the ``companion_admin_enabled`` server setting,
+      2. the caller carries the ``companion`` scope (a plain ``chat`` token never
+         reaches admin surface), and
+      3. the caller's real owner is a server admin.
+    Fail-closed: any missing piece (no auth_manager, unknown owner) → False.
+    """
+    from src.settings import get_setting
+
+    if not get_setting("companion_admin_enabled", False):
+        return False
+    if not has_companion_scope(request):
+        return False
+    owner = token_owner(request)
+    if not owner:
+        return False
+    auth_manager = getattr(request.app.state, "auth_manager", None)
+    if auth_manager is None:
+        return False
+    try:
+        return bool(auth_manager.is_admin(owner))
+    except Exception:
+        return False
+
+
+def require_companion_admin(request: Request) -> str:
+    """Gate for ADMIN-only companion endpoints. Returns the owner, or raises 403.
+
+    This is the ONLY sanctioned way to expose an admin-privileged server
+    capability (shell exec, vault export, MCP/cookbook admin, contacts) to a
+    paired phone. The stock routes hard-block the bearer pseudo-user ``api`` by
+    design (``current_user == "api"`` → 403, "RCE-after-signup"); we do NOT
+    bypass that loosely. Instead we re-establish privilege from the token's real
+    OWNER, behind an explicit, off-by-default admin opt-in:
+
+      1. ``companion_admin_enabled`` must be on (an admin set it deliberately),
+      2. the token must carry the ``companion`` scope (never a plain ``chat`` token),
+      3. the resolved owner must be a server admin (``auth_manager.is_admin``).
+
+    Fail-closed and non-disclosive: every failure raises the same generic 403 so
+    a caller can't probe which lock stopped them. Never call a stock admin route's
+    own ``_require_admin`` from here — that checks ``current_user`` (always ``api``
+    for a bearer caller) and would always 403.
+    """
+    if not companion_admin_available(request):
+        raise HTTPException(403, "Companion admin access is not enabled")
+    return token_owner(request)
+
+
 def require_companion_scope(request: Request) -> None:
     """Raise 403 unless the caller may touch the companion data views. The
     write handlers gate on this exactly like the reads gate on
@@ -204,6 +259,29 @@ def setup_companion_routes() -> APIRouter:
         finally:
             db.close()
         return {"endpoints": out}
+
+    @router.get("/admin/status")
+    def admin_status(request: Request):
+        """Coarse booleans telling a paired phone whether ADMIN-only companion
+        features (terminal/vault/mcp/cookbook/contacts) are reachable, so it can
+        show or hide those tabs. Returns ONLY booleans — never secrets or admin
+        internals. `enabled` = the server opt-in; `is_admin` = the token owner is
+        a server admin; `available` = both, i.e. the gate would let them through."""
+        from src.settings import get_setting
+
+        owner = token_owner(request)
+        auth_manager = getattr(request.app.state, "auth_manager", None)
+        is_admin = False
+        if owner and auth_manager is not None:
+            try:
+                is_admin = bool(auth_manager.is_admin(owner))
+            except Exception:
+                is_admin = False
+        return {
+            "enabled": bool(get_setting("companion_admin_enabled", False)),
+            "is_admin": is_admin,
+            "available": companion_admin_available(request),
+        }
 
     @router.get("/pair")
     def pair_page(request: Request):
