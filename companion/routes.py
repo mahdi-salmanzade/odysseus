@@ -615,6 +615,174 @@ def setup_companion_routes() -> APIRouter:
         finally:
             db.close()
 
+    # ---- Calendar ---------------------------------------------------------
+    # Owner-scoped view + light editing of the caller's calendars/events. Events
+    # are scoped THROUGH their calendar's owner (the stock route joins on
+    # CalendarCal.owner); we resolve the caller's calendar ids first, then scope
+    # events to that set. v1 does NOT expand RRULEs — recurring events surface at
+    # their base date only. Companion scope required.
+
+    def _cal_iso(dt):
+        try:
+            return dt.isoformat() if dt is not None else None
+        except Exception:
+            return None
+
+    def _cal_parse_dt(value):
+        from datetime import datetime as _dt
+        if not value:
+            return None
+        try:
+            return _dt.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+
+    @router.get("/calendars")
+    def calendars(request: Request):
+        """List the caller's own calendars. Companion scope."""
+        if not has_companion_scope(request):
+            raise HTTPException(403, "This token is not allowed to read calendars.")
+        from core.database import SessionLocal, CalendarCal
+
+        owner = token_owner(request)
+        out = []
+        db = SessionLocal()
+        try:
+            q = db.query(CalendarCal)
+            if owner:
+                q = q.filter((CalendarCal.owner == owner) | (CalendarCal.owner == None))  # noqa: E711
+            for c in q.all():
+                if not owner_can_see(c.owner, owner):
+                    continue
+                out.append({"id": c.id, "name": c.name, "color": c.color, "source": c.source})
+        finally:
+            db.close()
+        return {"items": out}
+
+    @router.get("/events")
+    def events(request: Request, start: str = "", end: str = ""):
+        """The caller's events overlapping [start, end] (ISO). Scoped to the
+        caller's calendars. Non-recurring overlap only (no RRULE expansion in
+        v1). Companion scope."""
+        if not has_companion_scope(request):
+            raise HTTPException(403, "This token is not allowed to read events.")
+        from core.database import SessionLocal, CalendarCal, CalendarEvent
+
+        owner = token_owner(request)
+        start_dt = _cal_parse_dt(start)
+        end_dt = _cal_parse_dt(end)
+        out = []
+        db = SessionLocal()
+        try:
+            cq = db.query(CalendarCal)
+            if owner:
+                cq = cq.filter((CalendarCal.owner == owner) | (CalendarCal.owner == None))  # noqa: E711
+            cal_ids = [c.id for c in cq.all() if owner_can_see(c.owner, owner)]
+            if cal_ids:
+                for e in db.query(CalendarEvent).filter(CalendarEvent.calendar_id.in_(cal_ids)).all():
+                    if e.status == "cancelled":
+                        continue
+                    # Window overlap (when no/unparseable range given → return all).
+                    if start_dt and e.dtend is not None and e.dtend <= start_dt:
+                        continue
+                    if end_dt and e.dtstart is not None and e.dtstart >= end_dt:
+                        continue
+                    out.append({
+                        "uid": e.uid,
+                        "calendar_id": e.calendar_id,
+                        "summary": e.summary,
+                        "description": e.description,
+                        "location": e.location,
+                        "dtstart": _cal_iso(e.dtstart),
+                        "dtend": _cal_iso(e.dtend),
+                        "all_day": bool(e.all_day),
+                        "rrule": e.rrule or "",
+                        "status": e.status,
+                        "importance": e.importance,
+                        "event_type": e.event_type,
+                        "color": e.color,
+                    })
+        finally:
+            db.close()
+        out.sort(key=lambda r: r.get("dtstart") or "")
+        return {"items": out}
+
+    def _owned_calendar(db, cal_id, owner):
+        from core.database import CalendarCal
+        cal = db.query(CalendarCal).filter(CalendarCal.id == cal_id).first()
+        # Strict: the calendar must be the caller's own (not missing, not a
+        # legacy null-owner shared row) before we let them write into it.
+        if not cal or cal.owner != owner:
+            raise HTTPException(404, "Calendar not found")
+        return cal
+
+    @router.post("/events")
+    def create_event(
+        request: Request,
+        calendar_id: str = Form(...),
+        summary: str = Form(...),
+        dtstart: str = Form(...),
+        dtend: str = Form(...),
+        description: str = Form(""),
+        location: str = Form(""),
+        all_day: str = Form("false"),
+    ):
+        """Create an event in one of the caller's OWN calendars. Companion scope."""
+        if not has_companion_scope(request):
+            raise HTTPException(403, "This token is not allowed to create events.")
+        import uuid as _uuid
+        from core.database import SessionLocal, CalendarEvent
+
+        owner = token_owner(request)
+        if not owner:
+            raise HTTPException(403, "Could not resolve an owner for this token.")
+        start_dt = _cal_parse_dt(dtstart)
+        end_dt = _cal_parse_dt(dtend)
+        if start_dt is None or end_dt is None:
+            raise HTTPException(400, "dtstart and dtend must be ISO datetimes")
+        db = SessionLocal()
+        try:
+            _owned_calendar(db, calendar_id, owner)
+            uid = str(_uuid.uuid4())
+            ev = CalendarEvent(
+                uid=uid,
+                calendar_id=calendar_id,
+                summary=summary,
+                description=description or "",
+                location=location or "",
+                dtstart=start_dt,
+                dtend=end_dt,
+                all_day=str(all_day).lower() == "true",
+                status="confirmed",
+            )
+            db.add(ev)
+            db.commit()
+            return {"uid": uid, "status": "ok"}
+        finally:
+            db.close()
+
+    @router.delete("/events/{uid}")
+    def delete_event(request: Request, uid: str):
+        """Delete one of the caller's events. 404 (not 403) when the event is
+        missing or lives in a calendar the caller doesn't own. Companion scope."""
+        if not has_companion_scope(request):
+            raise HTTPException(403, "This token is not allowed to delete events.")
+        from core.database import SessionLocal, CalendarEvent
+
+        owner = token_owner(request)
+        db = SessionLocal()
+        try:
+            ev = db.query(CalendarEvent).filter(CalendarEvent.uid == uid).first()
+            if not ev:
+                raise HTTPException(404, "Event not found")
+            # Ownership is via the event's calendar — reuse the strict gate.
+            _owned_calendar(db, ev.calendar_id, owner)
+            db.delete(ev)
+            db.commit()
+            return {"status": "deleted"}
+        finally:
+            db.close()
+
     # ---- Writes -----------------------------------------------------------
     # The reads above are the established pattern; these add the phone's
     # create/delete/toggle affordances. Each write requires the companion scope
