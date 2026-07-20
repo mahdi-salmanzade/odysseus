@@ -86,16 +86,20 @@ def test_token_without_scopes_cannot_read():
     assert has_companion_scope(_req(api_token=True, owner="alice", scopes=[])) is False
 
 
-# --- owner-scope rule (shared by all three views) --------------------------
+# --- owner-scope rule --------------------------------------------------------
+# owner_can_see is the generic read predicate used by the shareable views
+# (documents/gallery) where legacy null-owner rows are intentionally visible.
+# The PRIVATE companion views (notes/tasks/memory) do NOT use it — they filter
+# by EXACT owner (see read_owner + the handler tests below).
 
-def test_cross_owner_blocked_and_null_owner_shared():
+def test_owner_can_see_predicate():
     assert owner_can_see("alice", "alice") is True
     assert owner_can_see(None, "alice") is True       # shared row visible
     assert owner_can_see("bob", "alice") is False      # cross-owner blocked
     assert owner_can_see("alice", None) is False        # null caller sees no owned row
 
 
-# --- handler-level: /notes filters out another owner's rows ----------------
+# --- handler-level: /notes is strictly owner-scoped ------------------------
 
 def _notes_handler():
     router = setup_companion_routes()
@@ -105,21 +109,45 @@ def _notes_handler():
     raise AssertionError("/notes route not found")
 
 
-def test_notes_handler_excludes_other_owners_rows(monkeypatch):
-    # The SQL filter is the first line of defence; this proves the in-Python
-    # owner_can_see check also drops a cross-owner row that slipped through.
-    rows = [
-        SimpleNamespace(id="n1", owner="alice", title="mine", content="x", items=None, pinned=False, archived=False),
-        SimpleNamespace(id="n2", owner="bob", title="theirs", content="y", items=None, pinned=False, archived=False),
-        SimpleNamespace(id="n3", owner=None, title="shared", content="z", items=None, pinned=True, archived=False),
-    ]
-    _install_core_database(rows, monkeypatch)
-    handler = _notes_handler()
+_NOTE_ROWS = [
+    SimpleNamespace(id="n1", owner="alice", title="mine", content="x", items=None, pinned=False, archived=False),
+    SimpleNamespace(id="n2", owner="bob", title="theirs", content="y", items=None, pinned=False, archived=False),
+    SimpleNamespace(id="n3", owner=None, title="ownerless", content="z", items=None, pinned=True, archived=False),
+]
+
+
+def test_notes_handler_excludes_other_and_null_owner_rows(monkeypatch):
+    # An authenticated caller sees ONLY their own rows: never another owner's,
+    # and never a legacy null-owner row (which could carry residual private
+    # content). The fake query ignores SQL filters, so this pins the in-Python
+    # exact-owner guard that backs up the SQL WHERE.
+    _install_core_database(list(_NOTE_ROWS), monkeypatch)
     req = _req(api_token=True, owner="alice", scopes=["companion"])
-    result = handler(req)
+    result = _notes_handler()(req)
     ids = {n["id"] for n in result["items"]}
-    assert ids == {"n1", "n3"}          # alice's + shared, never bob's
-    assert "n2" not in ids
+    assert ids == {"n1"}                 # alice's only — not bob's, not the null-owner row
+
+
+def test_notes_handler_fails_closed_without_owner_when_auth_on(monkeypatch):
+    # Auth is ON (default) but no owner resolved → reject, rather than fall back
+    # to single-user mode and expose every account's private notes.
+    _install_core_database(list(_NOTE_ROWS), monkeypatch)
+    req = _req(api_token=True, owner=None, scopes=["companion"])
+    with pytest.raises(HTTPException) as exc:
+        _notes_handler()(req)
+    assert exc.value.status_code == 403
+
+
+def test_notes_handler_single_user_mode_shows_local_rows(monkeypatch):
+    # AUTH_ENABLED=false: owner is None by design and the owning routes skip the
+    # owner filter, so the companion view must show the local user's rows too
+    # (not silently empty). Mirrors routes/note_routes.list_notes.
+    monkeypatch.setenv("AUTH_ENABLED", "false")
+    _install_core_database(list(_NOTE_ROWS), monkeypatch)
+    req = _req(api_token=False, current_user=None)
+    result = _notes_handler()(req)
+    ids = {n["id"] for n in result["items"]}
+    assert ids == {"n1", "n2", "n3"}     # single-user: no owner boundary, show everything
 
 
 def test_notes_handler_rejects_chat_only_token(monkeypatch):
@@ -203,3 +231,65 @@ def test_all_data_routes_accept_paired_token(suffix, monkeypatch):
     req = _req(api_token=True, owner="alice", scopes=_paired_scopes())
     result = _data_handler(suffix)(req)
     assert isinstance(result, dict) and "items" in result
+
+
+# --- memory reads through the active MemoryManager, not the ORM table -------
+
+class _FakeMemMgr:
+    """Records load() calls; filters like the real MemoryManager.load(owner=...)."""
+
+    def __init__(self, entries):
+        self._entries = entries
+        self.calls = []
+
+    def load(self, owner=None):
+        self.calls.append(owner)
+        if owner is None:
+            return list(self._entries)
+        return [e for e in self._entries if e.get("owner") == owner]
+
+
+def _memory_handler(mm):
+    router = setup_companion_routes(memory_manager=mm)
+    for r in router.routes:
+        if getattr(r, "path", "").endswith("/memory"):
+            return r.endpoint
+    raise AssertionError("/memory route not found")
+
+
+def test_memory_reads_through_memory_manager_owner_scoped():
+    # The app persists memories via MemoryManager (memory.json), NOT the ORM
+    # Memory table — so the companion view must read the manager, exact-owner.
+    mm = _FakeMemMgr([
+        {"id": "m1", "text": "alice's", "category": "fact", "owner": "alice"},
+        {"id": "m2", "text": "bob's", "category": "fact", "owner": "bob"},
+    ])
+    req = _req(api_token=True, owner="alice", scopes=["companion"])
+    result = _memory_handler(mm)(req)
+    assert {m["id"] for m in result["items"]} == {"m1"}   # alice's only
+    assert mm.calls == ["alice"]                           # loaded exact-owner
+
+
+def test_memory_single_user_mode_loads_all(monkeypatch):
+    monkeypatch.setenv("AUTH_ENABLED", "false")
+    mm = _FakeMemMgr([
+        {"id": "m1", "text": "x", "category": "fact", "owner": "alice"},
+        {"id": "m2", "text": "y", "category": "fact", "owner": None},
+    ])
+    req = _req(api_token=False, current_user=None)
+    result = _memory_handler(mm)(req)
+    assert {m["id"] for m in result["items"]} == {"m1", "m2"}
+    assert mm.calls == [None]                              # unfiltered single-user load
+
+
+# --- P2: the companion scope round-trips through token management -----------
+
+def test_companion_scope_round_trips_in_token_management():
+    # Editing a paired token's permissions PATCHes the whole scope list; if
+    # `companion` weren't an allowed scope it would 400 (or be dropped), silently
+    # revoking the paired phone's notes/tasks/memory access.
+    from routes.api_token_routes import ALLOWED_SCOPES, _normalize_scopes
+
+    assert "companion" in ALLOWED_SCOPES
+    assert set(_normalize_scopes(["chat", "companion"])) == {"chat", "companion"}
+    assert set(_normalize_scopes("chat,companion")) == {"chat", "companion"}

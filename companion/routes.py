@@ -83,6 +83,48 @@ def has_companion_scope(request: Request) -> bool:
     return "companion" in scopes
 
 
+def _auth_disabled() -> bool:
+    """True only when the operator explicitly turned auth off (AUTH_ENABLED=false).
+
+    Mirrors ``src.auth_helpers._auth_disabled`` so the companion reads agree with
+    the rest of the app on what the supported single-user, no-login mode is.
+    """
+    import os
+    return os.getenv("AUTH_ENABLED", "true").lower() == "false"
+
+
+def read_owner(request: Request) -> str | None:
+    """Resolve the owner for a companion DATA read, failing closed.
+
+    Notes / tasks / memory are PRIVATE, so — like their owning routes — they are
+    filtered by EXACT owner and never widen to legacy null-owner "shared" rows
+    (that sharing is only appropriate for documents/gallery, not private data).
+
+    Returns the resolved owner, or ``None`` for the supported single-user
+    (``AUTH_ENABLED=false``) mode, where the owning routes also skip the owner
+    filter. If no owner resolves while auth is ON, the request is rejected rather
+    than treated as single-user — so an auth-middleware regression can't hand a
+    tokenless caller a blanket view of every account's private data.
+    """
+    owner = token_owner(request)
+    if owner:
+        return owner
+    if _auth_disabled():
+        return None
+    raise HTTPException(403, "No owner could be resolved for this request.")
+
+
+def _default_memory_manager():
+    """Fallback ``MemoryManager`` when the app didn't inject one.
+
+    ``setup_companion_routes`` is passed the app's live manager in app.py; this
+    only covers standalone/tooling callers, reading the same memory.json.
+    """
+    from src.memory import MemoryManager
+    from src.constants import DATA_DIR
+    return MemoryManager(DATA_DIR)
+
+
 def mint_pairing_token(owner: str, invalidate=None) -> tuple[str, str]:
     """Mint a pairing token AND invalidate the auth middleware's in-memory token
     cache, so the new token is accepted on the very next request without a server
@@ -97,7 +139,7 @@ def mint_pairing_token(owner: str, invalidate=None) -> tuple[str, str]:
     return token_id, raw_token
 
 
-def setup_companion_routes() -> APIRouter:
+def setup_companion_routes(memory_manager=None) -> APIRouter:
     router = APIRouter(prefix="/api/companion", tags=["companion"])
 
     @router.get("/ping")
@@ -273,15 +315,18 @@ def setup_companion_routes() -> APIRouter:
         import json as _json
         from core.database import SessionLocal, Note
 
-        owner = token_owner(request)
+        owner = read_owner(request)
         out = []
         db = SessionLocal()
         try:
+            # EXACT-owner filter (never null-owner "shared") — matches the owning
+            # note routes. Single-user (AUTH_ENABLED=false → owner None) skips the
+            # filter and shows the local user's rows, same as list_notes.
             q = db.query(Note).filter(Note.archived == False)  # noqa: E712
-            if owner:
-                q = q.filter((Note.owner == owner) | (Note.owner == None))  # noqa: E711
+            if owner is not None:
+                q = q.filter(Note.owner == owner)
             for n in q.all():
-                if not owner_can_see(n.owner, owner):
+                if owner is not None and n.owner != owner:
                     continue
                 try:
                     items = _json.loads(n.items) if n.items else None
@@ -302,15 +347,15 @@ def setup_companion_routes() -> APIRouter:
             raise HTTPException(403, "This token is not allowed to read tasks.")
         from core.database import SessionLocal, ScheduledTask
 
-        owner = token_owner(request)
+        owner = read_owner(request)
         out = []
         db = SessionLocal()
         try:
             q = db.query(ScheduledTask)
-            if owner:
-                q = q.filter((ScheduledTask.owner == owner) | (ScheduledTask.owner == None))  # noqa: E711
+            if owner is not None:
+                q = q.filter(ScheduledTask.owner == owner)
             for t in q.all():
-                if not owner_can_see(t.owner, owner):
+                if owner is not None and t.owner != owner:
                     continue
                 out.append({
                     "id": t.id, "name": t.name, "schedule": t.schedule,
@@ -323,24 +368,23 @@ def setup_companion_routes() -> APIRouter:
 
     @router.get("/memory")
     def memory(request: Request):
-        """The caller's own long-term memories (read-only). Requires the companion scope."""
+        """The caller's own long-term memories (read-only). Requires the companion scope.
+
+        Reads through the active ``MemoryManager`` (memory.json) — the store the
+        app actually writes to — not the ORM ``Memory`` table, which the running
+        app does not populate. ``load(owner=...)`` is exact-owner (no null-owner
+        sharing); single-user (owner None) returns the local user's memories.
+        """
         if not has_companion_scope(request):
             raise HTTPException(403, "This token is not allowed to read memory.")
-        from core.database import SessionLocal, Memory
 
-        owner = token_owner(request)
-        out = []
-        db = SessionLocal()
-        try:
-            q = db.query(Memory)
-            if owner:
-                q = q.filter((Memory.owner == owner) | (Memory.owner == None))  # noqa: E711
-            for m in q.all():
-                if not owner_can_see(m.owner, owner):
-                    continue
-                out.append({"id": m.id, "text": m.text, "category": m.category})
-        finally:
-            db.close()
+        owner = read_owner(request)
+        mm = memory_manager or _default_memory_manager()
+        entries = mm.load(owner=owner) if owner is not None else mm.load()
+        out = [
+            {"id": e.get("id"), "text": e.get("text"), "category": e.get("category")}
+            for e in (entries or [])
+        ]
         return {"items": out}
 
     return router
